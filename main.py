@@ -1,6 +1,6 @@
 import tensorflow as tf
-from diffusion_model import DiffusionModel  # Update import path to your diffusion model file
-from unet_tiny import model as unet_model   # Make sure this matches your reduced U-Net filename
+from model import DiffusionModel  # Update import path to your diffusion model file
+from unet_smaller import model as unet_model   # Make sure this matches your reduced U-Net filename
 
 # Create diffusion model with MATCHING IMAGE SIZE to U-Net
 diffusion = DiffusionModel(
