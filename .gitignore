@@ -1,4 +1,7 @@
 .vscode/
 test.py
 tf/
+dataset/
+__pycache__/
+training.log
 .gitignore

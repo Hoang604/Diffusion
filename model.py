@@ -5,7 +5,7 @@ from keras import Model
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from unet_smaller import model as unet_base  # Import your existing U-Net model
+from unet import model as unet_base  # Import your existing U-Net model
 
 class DiffusionModel:
     def __init__(
@@ -13,8 +13,6 @@ class DiffusionModel:
         img_size=256,
         img_channels=3,
         timesteps=1000,
-        beta_start=1e-4,
-        beta_end=0.02
     ):
         """
         Initialize the diffusion model
@@ -31,126 +29,99 @@ class DiffusionModel:
         self.timesteps = timesteps
         
         # Define noise schedule (linear between beta_start and beta_end)
-        self.betas = np.linspace(beta_start, beta_end, timesteps)
+        # Ensure all numpy arrays are float32
+        # Define cosine noise schedule (better than linear for many cases)
+        def cosine_beta_schedule(timesteps, s=0.008):
+            """
+            Create a cosine noise schedule as proposed in the improved DDPM paper
+            """
+            steps = timesteps + 1
+            x = np.linspace(0, timesteps, steps)
+            alphas_cumprod = np.cos(((x / timesteps) + s) / (1 + s) * np.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            return np.clip(betas, 0, 0.999).astype(np.float32)
+            
+        self.betas = cosine_beta_schedule(timesteps)
         
         # Pre-calculate diffusion parameters for efficiency
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = np.cumprod(self.alphas)
-        self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
-        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
-        self.sqrt_recip_alphas = np.sqrt(1.0 / self.alphas)
+        self.alphas = (1.0 - self.betas).astype(np.float32)
+        self.alphas_cumprod = np.cumprod(self.alphas).astype(np.float32)
+        self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1]).astype(np.float32)
+        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod).astype(np.float32)
+        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod).astype(np.float32)
+        self.sqrt_recip_alphas = np.sqrt(1.0 / self.alphas).astype(np.float32)
         
         # Parameters for sampling
-        self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
-        
-    def modify_unet_for_diffusion(self, base_model):
-        """
-        Modify the existing U-Net model for diffusion tasks by adding timestep embedding
-        
-        Args:
-            base_model: The base U-Net model
-        """
-        # Create a new model with the same U-Net structure but adding timestep input
-        inputs = Input(shape=(self.img_size, self.img_size, self.img_channels))
-        time_input = Input(shape=(1,))
-        
-        # Time embedding with sinusoidal positional encoding (similar to Transformers)
-        time_embed_dim = 256
-        positions = tf.range(0, time_embed_dim // 2, dtype=tf.float32)
-        frequencies = 1.0 / (10000.0**(2.0 * (positions / (time_embed_dim // 2))))
-        
-        def time_embedding(t):
-            embedding = tf.cast(t, dtype=tf.float32)
-            embedding = tf.reshape(embedding, [-1, 1])
-            embedding = tf.matmul(embedding, frequencies[None, :])
-            embedding = tf.concat([tf.sin(embedding), tf.cos(embedding)], axis=-1)
-            embedding = tf.reshape(embedding, [-1, time_embed_dim])
-            return embedding
-            
-        # Time embedding layer
-        time_embed = Lambda(lambda t: time_embedding(t))(time_input)
-        time_embed = Dense(time_embed_dim, activation="swish")(time_embed)
-        time_embed = Dense(time_embed_dim, activation="swish")(time_embed)
-        
-        # Pass the input through the existing U-Net layers, but inject time embedding
-        # at key points through the network
-        
-        # Extract layers from your base U-Net
-        # Here we're making a simplified adaptation - a complete implementation would 
-        # inject time information at multiple layers
-        
-        # Create a new U-Net model with the same architecture but accepting time embedding
-        # This is a simplified example - you'll need to adjust based on your U-Net structure
-        
-        # For a complete implementation, you would need to reimplement your U-Net
-        # adding time embedding at various stages
-        
-        # For demonstration, we'll use an approach that works with the existing U-Net
-        x = base_model.layers[1](inputs)  # Skip the input layer
-        
-        # Continue with the U-Net processing
-        for layer in base_model.layers[2:-1]:  # All layers except input and output
-            x = layer(x)
-        
-        # Final output
-        outputs = Conv2D(self.img_channels, (1, 1), activation='sigmoid')(x)
-        
-        diffusion_model = Model(inputs=[inputs, time_input], outputs=outputs)
-        
-        # Compile the model
-        diffusion_model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-            loss='mean_squared_error'
-        )
-        
-        return diffusion_model
-        
+        self.posterior_variance = (self.betas * 
+            (1.0 - self.alphas_cumprod_prev) / 
+            (1.0 - self.alphas_cumprod)).astype(np.float32)
+    
     def q_sample(self, x_0, t):
         """
-        Forward diffusion process: add noise to image according to timestep t
+        Add noise to images following the forward diffusion process.
         
         Args:
-            x_0: Original image with values in [0, 1]
-            t: Timestep
-        
+            x_0: Input images, shape [batch_size, height, width, channels]
+            t: Timesteps, shape [batch_size]
+            
         Returns:
-            Noisy version of x_0 at timestep t
+            x_t: Noisy images at timestep t
+            noise: The noise added to the images
         """
-        t = tf.cast(t, dtype=tf.int32)
-        noise = tf.random.normal(shape=tf.shape(x_0))
+        # Cast to float32 for computation
+        x_0 = tf.cast(x_0, tf.float32) / 255.0  # Normalize to [0, 1]
+        x_0 = x_0 * 2.0 - 1.0  # Scale to [-1, 1]
         
+        # Tạo noise ngẫu nhiên
+        noise = tf.random.normal(shape=tf.shape(x_0), dtype=tf.float32)
+
+        # Điều chỉnh t để phù hợp với kích thước batch thực tế
+        actual_batch_size = tf.shape(x_0)[0]
+        t = t[:actual_batch_size]  # Thêm dòng này để cắt t
+        
+        # Truy cập các tham số đã tính từ bảng tra
         sqrt_alphas_cumprod_t = tf.gather(self.sqrt_alphas_cumprod, t)
         sqrt_one_minus_alphas_cumprod_t = tf.gather(self.sqrt_one_minus_alphas_cumprod, t)
         
-        # Apply reshaping to match image dimensions
+        # Reshape để phù hợp với kích thước ảnh
         sqrt_alphas_cumprod_t = tf.reshape(sqrt_alphas_cumprod_t, [-1, 1, 1, 1])
         sqrt_one_minus_alphas_cumprod_t = tf.reshape(sqrt_one_minus_alphas_cumprod_t, [-1, 1, 1, 1])
         
-        # Formula: x_t = √(α_t) * x_0 + √(1-α_t) * ε
-        return sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise, noise
-    
-    def train(self, model, dataset, epochs=30, batch_size=32):
+        # Phương trình khuếch tán chuyển tiếp
+        x_t = sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
+        
+        # Làm sạch bộ nhớ, chỉ giữ lại kết quả cuối cùng
+        tf.keras.backend.clear_session()
+        
+        return x_t, noise
+        
+    def train(self, dataset, model=unet_base, epochs=30, batch_size=8, callbacks=None):
         """
         Train the diffusion model
-        
+    
         Args:
-            model: The neural network model (modified U-Net)
             dataset: Training dataset of images
+            model: The neural network model
             epochs: Number of training epochs
             batch_size: Batch size
+            callbacks: List of Keras callbacks
         """
+        if callbacks is None:
+            callbacks = []
+            
         for epoch in range(epochs):
             print(f"Epoch {epoch+1}/{epochs}")
             progress_bar = tqdm(total=len(dataset))
+            epoch_losses = []
             
             for x_batch in dataset.batch(batch_size):
-                # Normalize images to [-1, 1]
-                x_batch = (tf.cast(x_batch, tf.float32) / 127.5) - 1.0
+                # Get the actual batch size (might be smaller for the last batch)
+                actual_batch_size = tf.shape(x_batch)[0]
                 
-                # Sample random timesteps
+                # Sample random timesteps matching the actual batch size
                 t = tf.random.uniform(
-                    shape=[batch_size], 
+                    shape=[actual_batch_size], 
                     minval=0, 
                     maxval=self.timesteps, 
                     dtype=tf.int32
@@ -161,13 +132,15 @@ class DiffusionModel:
                 
                 # Train the model to predict the noise
                 loss = model.train_on_batch([x_t, t], noise_added)
+                epoch_losses.append(loss)
                 
                 progress_bar.update(1)
                 progress_bar.set_description(f"Loss: {loss:.4f}")
             
-            # Save model checkpoint
-            if (epoch + 1) % 5 == 0:
-                model.save_weights(f"diffusion_model_epoch_{epoch+1}.h5")
+            # Call callbacks at the end of each epoch
+            logs = {'loss': np.mean(epoch_losses)}
+            for callback in callbacks:
+                callback.on_epoch_end(epoch, logs=logs)
     
     def p_sample(self, model, x_t, t):
         """
@@ -181,14 +154,18 @@ class DiffusionModel:
         Returns:
             Predicted less noisy image at timestep t-1
         """
-        t_tensor = tf.ones(x_t.shape[0], dtype=tf.int32) * t
+        # Ensure everything is float32
+        x_t = tf.cast(x_t, tf.float32)
+        batch_size = tf.shape(x_t)[0]
+        t_tensor = tf.ones(batch_size, dtype=tf.int32) * t
         
         # Predict the noise component
         predicted_noise = model([x_t, t_tensor], training=False)
         
-        alpha_t = self.alphas[t]
-        alpha_cumprod_t = self.alphas_cumprod[t]
-        beta_t = self.betas[t]
+        # Cast parameters to float32
+        alpha_t = tf.cast(self.alphas[t], tf.float32)
+        alpha_cumprod_t = tf.cast(self.alphas_cumprod[t], tf.float32)
+        beta_t = tf.cast(self.betas[t], tf.float32)
         
         # Calculate the mean for sampling
         coeff = beta_t / tf.sqrt(1 - alpha_cumprod_t)
@@ -198,10 +175,10 @@ class DiffusionModel:
         # Calculate the variance
         variance = 0.0
         if t > 0:
-            variance = self.posterior_variance[t]
+            variance = tf.cast(self.posterior_variance[t], tf.float32)
             
         # Sample from posterior
-        noise = tf.random.normal(shape=x_t.shape)
+        noise = tf.random.normal(shape=x_t.shape, dtype=tf.float32)
         x_t_minus_1 = x_0_pred + tf.sqrt(variance) * noise
         
         return x_t_minus_1
